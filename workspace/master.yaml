@@ -1,29 +1,32 @@
-# master.yaml - task manifest
+# master.yaml - task manifest (updated to show new options)
 
 # Define tasks the orchestrator should run. Each task has:
 # - id: unique string
 # - trigger: on_change | periodic
 # - watch_path: glob under workspace/scales/ to watch for on_change triggers
-# - model: openai | local (prefer local when available)
-# - prompt_template: a simple template where {{file_contents}} is replaced by the watched file's content
-# - output_path: relative path under workspace/ where results are written
+# - model: auto | local | huggingface | openai or a list for explicit fallback order
+# - optional: llama_model, hf_model, openai_model to override defaults
+# - prompt_template: a template where {{file_contents}} is replaced by the watched file's content
+# - output_path: relative path under workspace/ where results are written. Supports placeholders:
+#     {{watch_basename}} {{task_id}} {{prompt_hash}}
 
 tasks:
   - id: summarize-markdown
     trigger: on_change
-    watch_path: scales/**.md
-    model: openai
+    watch_path: scales/**/*.md
+    model: auto
     prompt_template: |
       Summarize the following markdown file and produce an action list and short TODOs:
       {{file_contents}}
-    output_path: results/summary_{{watch_basename}}.txt
+    output_path: results/summary_{{watch_basename}}_{{prompt_hash}}.txt
 
   - id: gen-tests-periodic
     trigger: periodic
     interval_seconds: 3600
-    watch_path: scales/**.py
-    model: local
+    watch_path: scales/**/*.py
+    model: ["local", "openai"]
+    llama_model: /path/to/ggml-small.bin
     prompt_template: |
       Create pytest-compatible unit tests for the following Python file:
       {{file_contents}}
-    output_path: results/tests_{{watch_basename}}.py
+    output_path: results/tests_{{watch_basename}}_{{prompt_hash}}.py

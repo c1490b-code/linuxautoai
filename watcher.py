@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-watcher.py - watches workspace/scales and runs tasks defined in workspace/master.yaml
+watcher.py - improved orchestrator with multiple AI backends, unified outputs, idempotency,
+and hard protections against file-vs-directory conflicts.
 
-Requirements: pip install -r requirements.txt
+Key features added:
+- Runner registry with fallback order: local -> huggingface -> openai (configurable per-task)
+- Prompt hashing for idempotency (skips rerun if same prompt already processed)
+- Unified YAML front-matter metadata in outputs (backend, model, task, input_hash, created)
+- Safe filename rendering with placeholders: {{watch_basename}}, {{task_id}}, {{prompt_hash}}
+- Directory-vs-file conflict detection and safe alternate naming
+- Diagnostic scanner (scripts/scan_conflicts.py) added to repo
 
-Behavior summary:
-- Watches workspace/scales recursively for file changes
-- For each "on_change" task whose watch_path glob matches the changed file, runs the appropriate model runner
-- Also runs "periodic" tasks on their interval_seconds schedule (simple timer)
-- Writes outputs atomically (temp file then os.replace)
-- Simple directory-lock scheme prevents overlapping runs for the same task
-- Skips directories and temporary/editor files
+Runners are implemented as separate scripts in scripts/ and invoked as subprocesses
+for portability between Termux and Debian.
 """
 
 import os
@@ -26,6 +28,8 @@ import subprocess
 import tempfile
 import shutil
 from datetime import datetime
+import hashlib
+import json
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE = ROOT / "workspace"
@@ -35,6 +39,8 @@ RESULTS = WORKSPACE / "results"
 SCRIPTS = ROOT / "scripts"
 LOCKDIR = WORKSPACE / ".locks"
 LOGFILE = WORKSPACE / "watcher.log"
+
+DEFAULT_FALLBACK = ['local', 'huggingface', 'openai']
 
 # Helper: append log
 def log(msg):
@@ -69,12 +75,8 @@ def is_temporary_file(path: Path):
 
 def matches_glob(glob_pattern: str, path: str):
     # glob_pattern is relative to workspace
-    # Normalize both
     gp = str((WORKSPACE / glob_pattern).resolve())
     p = str(Path(path).resolve())
-    # Using fnmatch on full path; allow ** patterns
-    # Convert /**.ext to /**\/*.ext for easier matching
-    # Use fnmatch.fnmatchcase
     return fnmatch.fnmatch(p, gp)
 
 
@@ -91,34 +93,64 @@ def atomic_write_text(path: Path, text: str):
     os.replace(tmp, str(path))
 
 
-def run_model_runner(prompt: str, prefer_local: bool):
-    # prefer_local: try local runner first if configured; otherwise fall back
-    LLAMA_BIN = os.environ.get('LLAMA_CPP_BIN')
-    OPENAI_KEY = os.environ.get('OPENAI_API_KEY')
-    if prefer_local and LLAMA_BIN and os.path.exists(LLAMA_BIN):
-        runner = SCRIPTS / 'run_model_local.py'
-        cmd = [sys.executable, str(runner), '--prompt', prompt]
-        log(f"Running local model via {LLAMA_BIN}")
-    elif OPENAI_KEY:
-        runner = SCRIPTS / 'run_model_openai.py'
-        cmd = [sys.executable, str(runner), '--prompt', prompt]
-        log("Running model via OpenAI API")
-    else:
-        raise RuntimeError('No model configured: set LLAMA_CPP_BIN or OPENAI_API_KEY')
-    # run and capture stdout
+def prompt_hash(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:16]
+
+
+def read_existing_input_hash(path: Path):
+    """If the file exists and has YAML front-matter with input_hash, return it"""
     try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return proc.stdout
-    except subprocess.CalledProcessError as e:
-        log(f"Runner failed: {e}; stdout: {e.stdout}; stderr: {e.stderr}")
-        raise
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            head = f.read(8192)
+        if head.startswith('---'):
+            # find second ---
+            parts = head.split('---', 2)
+            if len(parts) >= 3:
+                meta = parts[1]
+                data = yaml.safe_load(meta)
+                return data.get('input_hash') if isinstance(data, dict) else None
+    except Exception as e:
+        log(f"Failed reading existing file for input_hash: {e}")
+    return None
+
+
+def make_output_text(backend: str, model: str, task_id: str, input_hash: str, body: str) -> str:
+    meta = {
+        'backend': backend,
+        'model': model,
+        'task': task_id,
+        'input_hash': input_hash,
+        'created': datetime.utcnow().isoformat() + 'Z'
+    }
+    fm = '---\n' + yaml.safe_dump(meta) + '---\n\n'
+    return fm + body
+
+
+def safe_filename(name: str) -> str:
+    # Basic sanitization: remove slashes, replace spaces, keep letters/numbers/._-@
+    keep = []
+    for ch in name:
+        if ch.isalnum() or ch in '._-@':
+            keep.append(ch)
+        else:
+            keep.append('_')
+    s = ''.join(keep)
+    if len(s) == 0:
+        return 'file'
+    return s[:200]
+
+
+def render_outpath(template: str, watch_basename: str, task_id: str, phash: str) -> Path:
+    t = template.replace('{{watch_basename}}', safe_filename(watch_basename))
+    t = t.replace('{{task_id}}', safe_filename(task_id))
+    t = t.replace('{{prompt_hash}}', phash)
+    return WORKSPACE / t
 
 
 def acquire_lock(lockname: str):
     LOCKDIR.mkdir(parents=True, exist_ok=True)
     path = LOCKDIR / f"{lockname}.lock"
     try:
-        # create directory as atomic lock (works cross-platform)
         os.mkdir(path)
         return path
     except FileExistsError:
@@ -135,6 +167,65 @@ def release_lock(lockpath: Path):
         log(f"Lock release error: {e}")
 
 
+def run_runner_subprocess(runner_script: Path, prompt: str, extra_env: dict = None) -> str:
+    cmd = [sys.executable, str(runner_script), '--prompt', prompt]
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+        return proc.stdout
+    except subprocess.CalledProcessError as e:
+        log(f"Runner {runner_script} failed: rc={e.returncode}; stderr={e.stderr}")
+        raise
+
+
+def run_model_runner(prompt: str, prefer_list: list, task: dict) -> tuple:
+    """Try runners in prefer_list order. Return (backend, model, text). Raises if none available."""
+    # normalize prefer_list: could be string 'auto' or list
+    for backend in prefer_list:
+        if backend == 'local':
+            binpath = os.environ.get('LLAMA_CPP_BIN')
+            modelpath = os.environ.get('LLAMA_MODEL') or task.get('llama_model')
+            if binpath and os.path.exists(binpath) and modelpath and os.path.exists(modelpath):
+                # pass model via env so the runner script can pick it up
+                try:
+                    out = run_runner_subprocess(SCRIPTS / 'run_model_local.py', prompt, {'LLAMA_CPP_BIN': binpath, 'LLAMA_MODEL': modelpath})
+                    return ('local', os.path.basename(modelpath), out)
+                except Exception:
+                    log('Local runner failed, trying next')
+                    continue
+            else:
+                log('Local runner not configured or model missing')
+        elif backend == 'huggingface':
+            token = os.environ.get('HUGGINGFACE_API_TOKEN')
+            hf_model = os.environ.get('HUGGINGFACE_MODEL') or task.get('hf_model')
+            if token and hf_model:
+                try:
+                    out = run_runner_subprocess(SCRIPTS / 'run_model_hf.py', prompt, {'HUGGINGFACE_API_TOKEN': token, 'HUGGINGFACE_MODEL': hf_model})
+                    return ('huggingface', hf_model, out)
+                except Exception:
+                    log('Hugging Face runner failed, trying next')
+                    continue
+            else:
+                log('Hugging Face not configured (HUGGINGFACE_API_TOKEN/HUGGINGFACE_MODEL)')
+        elif backend == 'openai':
+            key = os.environ.get('OPENAI_API_KEY')
+            model = os.environ.get('OPENAI_MODEL') or task.get('openai_model') or 'gpt-4o-mini'
+            if key:
+                try:
+                    out = run_runner_subprocess(SCRIPTS / 'run_model_openai.py', prompt, {'OPENAI_API_KEY': key, 'OPENAI_MODEL': model})
+                    return ('openai', model, out)
+                except Exception:
+                    log('OpenAI runner failed, trying next')
+                    continue
+            else:
+                log('OpenAI not configured')
+        else:
+            log(f'Unknown backend {backend}, skipping')
+    raise RuntimeError('No runner succeeded')
+
+
 def render_prompt(template: str, file_contents: str, watch_basename: str):
     return template.replace('{{file_contents}}', file_contents).replace('{{watch_basename}}', watch_basename)
 
@@ -146,7 +237,6 @@ def run_task(task: dict, changed_path: Path = None):
         log(f"Task {task_id} is already running, skipping")
         return
     try:
-        # gather file contents if applicable
         file_contents = ''
         basename = 'unknown'
         if changed_path and changed_path.exists() and changed_path.is_file():
@@ -157,15 +247,38 @@ def run_task(task: dict, changed_path: Path = None):
             except Exception as e:
                 log(f"Failed reading changed file {changed_path}: {e}")
         prompt = render_prompt(task.get('prompt_template', ''), file_contents, basename)
-        prefer_local = (task.get('model') == 'local')
-        out = run_model_runner(prompt, prefer_local=prefer_local)
-        # compute output path
-        outpath_t = task.get('output_path', 'results/output.txt')
-        # replace token {{watch_basename}} if present
-        outpath_t = outpath_t.replace('{{watch_basename}}', basename)
-        outpath = WORKSPACE / outpath_t
-        atomic_write_text(outpath, out)
-        log(f"Task {task_id} wrote {outpath}")
+        phash = prompt_hash(prompt)
+        # determine output filename
+        out_template = task.get('output_path', 'results/{{task_id}}_{{watch_basename}}_{{prompt_hash}}.txt')
+        outpath = render_outpath(out_template, basename, task_id, phash)
+        # idempotency: skip if existing file has same input_hash
+        existing_hash = None
+        if outpath.exists() and outpath.is_file():
+            existing_hash = read_existing_input_hash(outpath)
+        if existing_hash == phash:
+            log(f"Skipping task {task_id} for {basename}: existing output with same input_hash")
+            return
+        # if outpath exists but is a directory, pick alternate
+        if outpath.exists() and outpath.is_dir():
+            alt = outpath.with_name(outpath.name + '.file')
+            log(f"Conflict: expected file but found directory at {outpath}. Using {alt}")
+            outpath = alt
+        # choose fallback order
+        model_pref = task.get('model')
+        if isinstance(model_pref, list):
+            prefer = model_pref
+        elif isinstance(model_pref, str):
+            if model_pref == 'auto' or model_pref == 'fallback' or model_pref is None:
+                prefer = DEFAULT_FALLBACK
+            else:
+                prefer = [model_pref]
+        else:
+            prefer = DEFAULT_FALLBACK
+        # run model
+        backend, model, body = run_model_runner(prompt, prefer, task)
+        outtext = make_output_text(backend, model, task_id, phash, body)
+        atomic_write_text(outpath, outtext)
+        log(f"Task {task_id} wrote {outpath} (backend={backend} model={model})")
     except Exception as e:
         log(f"Task {task_id} failed: {e}")
     finally:
@@ -187,7 +300,6 @@ class ChangeHandler(FileSystemEventHandler):
             watch = task.get('watch_path')
             if not watch:
                 continue
-            # glob matching
             try:
                 if matches_glob(watch, str(p)):
                     log(f"Change detected: {p} -> running {task.get('id')}")
@@ -197,7 +309,6 @@ class ChangeHandler(FileSystemEventHandler):
 
 
 def periodic_loop(interval=10):
-    """Run periodic tasks: every `interval` seconds, check manifest for periodic tasks and run them if their interval_seconds elapsed."""
     last_run = {}
     while True:
         manifest = load_manifest()
@@ -211,9 +322,7 @@ def periodic_loop(interval=10):
             lr = last_run.get(tid, 0)
             if now - lr >= ival:
                 log(f"Running periodic task {tid}")
-                # find files that match watch_path and process each
                 watch = task.get('watch_path')
-                # naive: walk scales and test fnmatch
                 for fp in SCALES.rglob('*'):
                     if fp.is_file() and not is_temporary_file(fp):
                         try:
@@ -228,6 +337,11 @@ def periodic_loop(interval=10):
 def main():
     if not WORKSPACE.exists():
         WORKSPACE.mkdir(parents=True, exist_ok=True)
+    if not SCALES.exists():
+        SCALES.mkdir(parents=True, exist_ok=True)
+    if not RESULTS.exists():
+        RESULTS.mkdir(parents=True, exist_ok=True)
+
     if not MANIFEST.exists():
         log(f"No manifest at {MANIFEST} - create one first (sample at workspace/master.yaml)")
 
