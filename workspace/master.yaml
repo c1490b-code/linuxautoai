@@ -1,14 +1,4 @@
-# master.yaml - task manifest (updated to show new options)
-
-# Define tasks the orchestrator should run. Each task has:
-# - id: unique string
-# - trigger: on_change | periodic
-# - watch_path: glob under workspace/scales/ to watch for on_change triggers
-# - model: auto | local | huggingface | openai or a list for explicit fallback order
-# - optional: llama_model, hf_model, openai_model to override defaults
-# - prompt_template: a template where {{file_contents}} is replaced by the watched file's content
-# - output_path: relative path under workspace/ where results are written. Supports placeholders:
-#     {{watch_basename}} {{task_id}} {{prompt_hash}}
+# master.yaml - extended examples including pytorch and pygpt-backed tasks
 
 tasks:
   - id: summarize-markdown
@@ -30,3 +20,21 @@ tasks:
       Create pytest-compatible unit tests for the following Python file:
       {{file_contents}}
     output_path: results/tests_{{watch_basename}}_{{prompt_hash}}.py
+
+  - id: local-pytorch-summarize
+    trigger: on_change
+    watch_path: scales/**/*.md
+    model: ["local", "pytorch", "openai"]
+    prompt_template: |
+      Use a local transformers model to summarize this file. Return a short summary and 3 next steps.
+      {{file_contents}}
+    output_path: results/pytorch_summary_{{watch_basename}}_{{prompt_hash}}.txt
+
+  - id: pygpt-snippet
+    trigger: on_change
+    watch_path: scales/snippets/**/*.txt
+    model: ["pygpt", "openai"]
+    prompt_template: |
+      Provide a cleaned-up, style-unified version of this snippet. Normalize to concise language.
+      {{file_contents}}
+    output_path: results/pygpt_snippet_{{watch_basename}}_{{prompt_hash}}.txt

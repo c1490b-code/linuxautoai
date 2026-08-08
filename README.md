@@ -1,42 +1,22 @@
-AI orchestrator for Linux desktop (Debian) and Android (Termux) that watches a synced workspace and runs AI tasks (local llama.cpp, Hugging Face Inference, or OpenAI) writing results back to files.
+Updated instructions: adding PyTorch/transformers and generic pygpt support.
 
-This updated version adds:
-- Multiple runner backends with fallback order
-- Unified YAML front-matter output format (metadata + AI text body)
-- Idempotency via prompt hashing (skips duplicate prompts)
-- Strong safeguards against file-vs-directory conflicts and atomic writes
-- Diagnostic scanner to list suspicious directories
+PyTorch (transformers) runner
+- Uses scripts/run_model_torch.py which relies on the transformers library and a compatible torch installation.
+- Configure model with: export PYTORCH_MODEL="gpt2" or a larger HF model id.
+- Configure device: export RUNNER_DEVICE="cpu" or "cuda" or leave as "auto".
+- On Debian install torch via pip or follow official instructions. Example for cpu-only:
+  pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-Quick start highlights
-- Ensure you have Python deps: pip install --user -r requirements.txt
-- Configure at least one backend via environment variables:
-  - Local: LLAMA_CPP_BIN (path to llama.cpp main) and LLAMA_MODEL (ggml model path)
-  - Hugging Face: HUGGINGFACE_API_TOKEN and optional HUGGINGFACE_MODEL (or per-task hf_model)
-  - OpenAI: OPENAI_API_KEY and optional OPENAI_MODEL (or per-task openai_model)
-- Use Syncthing to sync the workspace/ folder between devices.
-- Edit workspace/master.yaml to define tasks and model fallback order.
-- Run python3 watcher.py to test.
+pygpt / gpt4all adapter
+- scripts/run_model_pygpt.py tries common local wrappers (pygpt, gpt4all, pygpt4all, llama_cpp).
+- Install your preferred library and set required env vars (e.g., LLAMA_PY_MODEL for llama_cpp).
+- This adapter provides a path to run lightweight local models that may be easier to install on mobile.
 
-Output format
-Outputs written by the orchestrator include a YAML front-matter with these fields:
-- backend: which runner produced the output (local/huggingface/openai)
-- model: model name used
-- task: task id
-- input_hash: truncated sha256 of the rendered prompt (used for idempotency)
-- created: ISO timestamp
+Fallback order
+- Default order is now: local -> pytorch -> pygpt -> huggingface -> openai (watcher.py updated accordingly).
+- Per-task model order can be set using the `model` field in workspace/master.yaml (a string or list).
 
-Followed by the AI-generated text body.
-
-Diagnostic
-- scripts/scan_conflicts.py will list directories in the workspace for inspection.
-
-Repository layout
-- watcher.py - orchestrator
-- workspace/master.yaml - manifest
-- scripts/run_model_openai.py
-- scripts/run_model_local.py
-- scripts/run_model_hf.py
-- scripts/scan_conflicts.py
-- deploy/ai-orchestrator.service
-- scripts/termux_start.sh
+Notes about Android/Termux
+- PyTorch is difficult to run on Termux; prefer local llama.cpp or pygpt/gpt4all variants that are built for aarch64.
+- The orchestrator will try backends in order and fall back if a runner is not available.
 

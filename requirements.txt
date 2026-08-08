@@ -2,3 +2,7 @@ watchdog
 pyyaml
 openai
 requests
+transformers
+accelerate
+sentencepiece
+bitsandbytes
