@@ -1,0 +1,13 @@
+[Unit]
+Description=AI Orchestrator (linuxautoai)
+After=network.target
+
+[Service]
+Type=simple
+User=%u
+WorkingDirectory=%h/linuxautoai
+ExecStart=/usr/bin/env python3 watcher.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+watcher.log
+workspace/results/
+__pycache__/
+*.pyc
+.env
+llama-models/
